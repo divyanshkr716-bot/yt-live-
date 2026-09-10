@@ -274,24 +274,12 @@ class LiveStreamService : Service() {
 
             val rtmp = RtmpFromFile(connectChecker, videoDecoderInterface, audioDecoderInterface)
 
-            // Android 10 (API 29) devices can expose vendor H.264 encoders that
-            // report themselves as supported but fail when MediaCodec.start()
-            // is actually called. For Android 10, use the Android software H.264
-            // encoder and keep AAC hardware encoding when possible. This avoids
-            // the common "start failed" crash/disconnect on API 29.
-            //
-            // On Android 11+ keep hardware H.264/AAC as the normal path, with
-            // the software fallback below if MediaCodec.start() throws.
-            val android10SafeMode = Build.VERSION.SDK_INT == Build.VERSION_CODES.Q
-            if (forceSoftwareCodec || android10SafeMode) {
-                rtmp.setForce(CodecUtil.Force.SOFTWARE, CodecUtil.Force.HARDWARE)
-                log(
-                    if (forceSoftwareCodec) {
-                        "Using software H.264 + hardware AAC compatibility mode"
-                    } else {
-                        "Android 10 detected: using software H.264 + hardware AAC"
-                    }
-                )
+            // Prefer the device H.264/AAC hardware codecs. Some Android 10
+            // vendor codecs fail at MediaCodec.start(); the catch block below
+            // retries once with Android's software codecs for compatibility.
+            if (forceSoftwareCodec) {
+                rtmp.setForce(CodecUtil.Force.SOFTWARE, CodecUtil.Force.SOFTWARE)
+                log("Retrying with software H.264/AAC codecs for Android compatibility")
             } else {
                 rtmp.setForce(CodecUtil.Force.HARDWARE, CodecUtil.Force.HARDWARE)
                 log("Using hardware H.264/AAC codecs")
@@ -332,13 +320,7 @@ class LiveStreamService : Service() {
 
             rtmpFromFile = rtmp
             rtmp.startStream(endpoint)
-            log(
-                if (Build.VERSION.SDK_INT == Build.VERSION_CODES.Q || forceSoftwareCodec) {
-                    "Streaming pipeline started with Android 10 compatibility codecs"
-                } else {
-                    "Streaming pipeline started with hardware H.264 MediaCodec"
-                }
-            )
+            log("Streaming pipeline started with hardware H.264 MediaCodec")
 
         } catch (e: Exception) {
             Log.e(TAG, "Error starting streaming pipeline", e)
