@@ -28,7 +28,6 @@ import com.example.model.StreamStatus
 import com.pedro.common.ConnectChecker
 import com.pedro.encoder.input.decoder.AudioDecoderInterface
 import com.pedro.encoder.input.decoder.VideoDecoderInterface
-import com.pedro.encoder.utils.CodecUtil
 import com.pedro.library.rtmp.RtmpFromFile
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -278,10 +277,10 @@ class LiveStreamService : Service() {
             // vendor codecs fail at MediaCodec.start(); the catch block below
             // retries once with Android's software codecs for compatibility.
             if (forceSoftwareCodec) {
-                rtmp.setForce(CodecUtil.Force.SOFTWARE, CodecUtil.Force.SOFTWARE)
+                rtmp.forceCodecType(CodecUtil.CodecType.SOFTWARE, CodecUtil.CodecType.SOFTWARE)
                 log("Retrying with software H.264/AAC codecs for Android compatibility")
             } else {
-                rtmp.setForce(CodecUtil.Force.HARDWARE, CodecUtil.Force.HARDWARE)
+                rtmp.forceCodecType(CodecUtil.CodecType.HARDWARE, CodecUtil.CodecType.HARDWARE)
                 log("Using hardware H.264/AAC codecs")
             }
 
