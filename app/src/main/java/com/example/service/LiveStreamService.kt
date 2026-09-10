@@ -28,6 +28,7 @@ import com.example.model.StreamStatus
 import com.pedro.common.ConnectChecker
 import com.pedro.encoder.input.decoder.AudioDecoderInterface
 import com.pedro.encoder.input.decoder.VideoDecoderInterface
+import com.pedro.encoder.utils.CodecUtil
 import com.pedro.library.rtmp.RtmpFromFile
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -39,6 +40,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -56,6 +58,7 @@ class LiveStreamService : Service() {
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
 
     private var currentVideoUri: Uri? = null
+    private var cachedVideoFile: File? = null
     private var currentVideoName: String = "Selected Video"
     private var currentConfig: StreamConfig = StreamConfig()
     private var isUserInitiatedStop = false
@@ -169,9 +172,28 @@ class LiveStreamService : Service() {
         return START_NOT_STICKY
     }
 
-    private fun startStreamingPipeline() {
-        val uri = currentVideoUri ?: return
+    private fun startStreamingPipeline(forceSoftwareCodec: Boolean = false) {
+        val sourceUri = currentVideoUri ?: return
         val endpoint = currentConfig.fullRtmpEndpoint
+
+        // Android 10+ uses scoped storage. Materialize the selected SAF document
+        // into the app's private cache so MediaExtractor/MediaCodec can access it
+        // reliably after the app is backgrounded.
+        val uri = try {
+            getLocalCacheUri(sourceUri)
+        } catch (e: Exception) {
+            log("Failed to prepare local video: ${e.message}")
+            Log.e(TAG, "Failed to cache selected video", e)
+            _streamStatus.update {
+                it.copy(
+                    state = StreamStateEnum.ERROR,
+                    errorMessage = "Cannot access selected video"
+                )
+            }
+            stopStreamingInternal(StreamStateEnum.ERROR)
+            stopSelf()
+            return
+        }
 
         try {
             // Clean up previous instance if any
@@ -251,6 +273,30 @@ class LiveStreamService : Service() {
             }
 
             val rtmp = RtmpFromFile(connectChecker, videoDecoderInterface, audioDecoderInterface)
+
+            // Android 10 (API 29) devices can expose vendor H.264 encoders that
+            // report themselves as supported but fail when MediaCodec.start()
+            // is actually called. For Android 10, use the Android software H.264
+            // encoder and keep AAC hardware encoding when possible. This avoids
+            // the common "start failed" crash/disconnect on API 29.
+            //
+            // On Android 11+ keep hardware H.264/AAC as the normal path, with
+            // the software fallback below if MediaCodec.start() throws.
+            val android10SafeMode = Build.VERSION.SDK_INT == Build.VERSION_CODES.Q
+            if (forceSoftwareCodec || android10SafeMode) {
+                rtmp.setForce(CodecUtil.Force.SOFTWARE, CodecUtil.Force.HARDWARE)
+                log(
+                    if (forceSoftwareCodec) {
+                        "Using software H.264 + hardware AAC compatibility mode"
+                    } else {
+                        "Android 10 detected: using software H.264 + hardware AAC"
+                    }
+                )
+            } else {
+                rtmp.setForce(CodecUtil.Force.HARDWARE, CodecUtil.Force.HARDWARE)
+                log("Using hardware H.264/AAC codecs")
+            }
+
             // Enable native infinite seamless looping
             rtmp.setLoopMode(true)
 
@@ -286,19 +332,80 @@ class LiveStreamService : Service() {
 
             rtmpFromFile = rtmp
             rtmp.startStream(endpoint)
-            log("Streaming pipeline started with hardware H.264 MediaCodec")
+            log(
+                if (Build.VERSION.SDK_INT == Build.VERSION_CODES.Q || forceSoftwareCodec) {
+                    "Streaming pipeline started with Android 10 compatibility codecs"
+                } else {
+                    "Streaming pipeline started with hardware H.264 MediaCodec"
+                }
+            )
 
         } catch (e: Exception) {
-            log("Error starting streaming pipeline: ${e.message}")
-            _streamStatus.update {
-                it.copy(
-                    state = StreamStateEnum.ERROR,
-                    errorMessage = e.message ?: "Failed to start stream"
-                )
+            Log.e(TAG, "Error starting streaming pipeline", e)
+            log("Error starting streaming pipeline: ${e.javaClass.simpleName}: ${e.message}")
+
+            // A number of Android 10 devices expose a hardware H.264/AAC
+            // encoder that passes prepareVideo/prepareAudio but fails when
+            // MediaCodec.start() is actually called. Retry once with the
+            // software codecs instead of immediately killing the stream.
+            if (!forceSoftwareCodec) {
+                try {
+                    rtmpFromFile?.let {
+                        if (it.isStreaming) it.stopStream()
+                    }
+                } catch (stopError: Exception) {
+                    Log.w(TAG, "Failed to stop failed hardware pipeline", stopError)
+                }
+                rtmpFromFile = null
+
+                log("Hardware codec start failed; retrying once with software codecs...")
+                serviceScope.launch {
+                    delay(500)
+                    if (isActive && !isUserInitiatedStop) {
+                        startStreamingPipeline(forceSoftwareCodec = true)
+                    }
+                }
+            } else {
+                _streamStatus.update {
+                    it.copy(
+                        state = StreamStateEnum.ERROR,
+                        errorMessage = e.message ?: "Failed to start stream on hardware and software codecs"
+                    )
+                }
+                stopStreamingInternal(StreamStateEnum.ERROR)
+                stopSelf()
             }
-            stopStreamingInternal(StreamStateEnum.ERROR)
-            stopSelf()
         }
+    }
+
+    private fun getLocalCacheUri(sourceUri: Uri): Uri {
+        val existing = cachedVideoFile
+        if (existing != null && existing.exists() && existing.length() > 0L) {
+            return Uri.fromFile(existing)
+        }
+
+        val extension = when {
+            sourceUri.toString().contains(".mkv", ignoreCase = true) -> ".mkv"
+            sourceUri.toString().contains(".webm", ignoreCase = true) -> ".webm"
+            else -> ".mp4"
+        }
+        val target = File(cacheDir, "stream_source$extension")
+        if (target.exists()) target.delete()
+
+        contentResolver.openInputStream(sourceUri).use { input ->
+            requireNotNull(input) { "Unable to open selected video" }
+            target.outputStream().use { output ->
+                input.copyTo(output, DEFAULT_BUFFER_SIZE)
+            }
+        }
+
+        if (!target.exists() || target.length() == 0L) {
+            throw IllegalStateException("Selected video is empty or inaccessible")
+        }
+
+        cachedVideoFile = target
+        log("Video copied to private app cache (${target.length() / (1024 * 1024)} MB)")
+        return Uri.fromFile(target)
     }
 
     private fun handleConnectionFailure(reason: String) {
@@ -579,6 +686,10 @@ class LiveStreamService : Service() {
         stopStreamingInternal(StreamStateEnum.STOPPED)
         unregisterNetworkCallback()
         releaseLocks()
+        cachedVideoFile?.let {
+            try { if (it.exists()) it.delete() } catch (_: Exception) {}
+        }
+        cachedVideoFile = null
         log("LiveStreamService destroyed")
     }
 
