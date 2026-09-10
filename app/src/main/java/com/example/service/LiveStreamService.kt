@@ -325,6 +325,13 @@ class LiveStreamService : Service() {
         } catch (e: Exception) {
             Log.e(TAG, "Error starting streaming pipeline", e)
             log("Error starting streaming pipeline: ${e.javaClass.simpleName}: ${e.message}")
+            var cause: Throwable? = e
+            var causeIndex = 0
+            while (cause != null && causeIndex < 8) {
+                log("Codec error [$causeIndex]: ${cause.javaClass.simpleName}: ${cause.message}")
+                cause = cause.cause
+                causeIndex++
+            }
 
             // A number of Android 10 devices expose a hardware H.264/AAC
             // encoder that passes prepareVideo/prepareAudio but fails when
